@@ -43,14 +43,32 @@ metoda `connect()`):
 
 ## Stan projektu
 
-Działa: połączenie, wysyłanie i odbieranie wiadomości (wyświetlana
-jest aktualnie tylko najnowsza wiadomość - `Stream` sam z siebie
-nie pamięta historii).
+Działa:
+- Połączenie, wysyłanie i odbieranie wiadomości, z pełną,
+  rosnącą historią.
+- Wiadomości systemowe: gdy użytkownik się rozłączy, backend
+  rozsyła do pozostałych informację o tym fakcie (wyświetlaną
+  na froncie inaczej niż zwykłe wiadomości).
+- Obsługa utraty połączenia: frontend rozróżnia błąd połączenia
+  (`onError`) od jego zamknięcia (`onDone`) i pokazuje stosowny
+  komunikat zamiast ciszy / wiecznego ładowania.
+
+Ważna zasada, na którą warto uważać przy rozbudowie: frontend
+(`ChatService.sendMessage`) wysyła do serwera WYŁĄCZNIE surowy
+tekst wiadomości, bez pakowania w JSON z polem `user` - backend
+sam już zna nazwę użytkownika (ma ją z adresu URL,
+`/ws/{username}`) i to on skleja pełną wiadomość przed
+rozesłaniem. Wysłanie gotowego JSON-a z frontendu spowodowałoby,
+że backend potraktowałby go jako zwykły tekst i zagnieździłby go
+wewnątrz kolejnego pola `text`.
 
 Do zrobienia:
-- Rosnąca lista wiadomości (`.listen()` + `setState` +
-  `ListView.builder` zamiast samego `StreamBuilder`).
 - Ekran logowania (obecnie `username` jest na sztywno wpisane
   w `lib/main.dart`).
-- Obsługa `snapshot.hasError` w UI (obecnie błąd połączenia
-  pokazuje się tylko jako nieskończone ładowanie, bez komunikatu).
+- Ponowne łączenie (reconnect) po utracie połączenia - obecnie
+  `_connectionError` ustawia się raz i na stałe, bez prób
+  automatycznego ponownego połączenia.
+- Adres serwera w `chat_service.dart` jest na sztywno ustawiony
+  na `10.0.2.2` (adres wymagany na emulatorze Androida) - na
+  innych platformach (web, desktop, prawdziwe urządzenie) trzeba
+  go tymczasowo zmieniać ręcznie; docelowo warto to zautomatyzować.

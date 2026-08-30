@@ -36,14 +36,18 @@ class ChatService {
     );
   }
 
-  /// Wysyła wiadomość tekstową do serwera.
+  /// Wysyła surowy tekst wiadomości do serwera.
   ///
-  /// Pakuje tekst razem z [username] w model [Message], zamienia
-  /// go na mapę (`toJson`), a potem na tekstowy JSON (`jsonEncode`)
-  /// - dopiero taki string może zostać wysłany przez WebSocket.
+  /// Wysyłamy TYLKO tekst, bez pakowania w [Message] - backend
+  /// sam już zna [username] (ma go z adresu URL, `/ws/{username}`)
+  /// i to on skleja pełną wiadomość (user + text) przed
+  /// rozesłaniem jej dalej. Gdyby frontend wysyłał tu gotowy
+  /// JSON z polem `user`, backend potraktowałby cały ten JSON
+  /// jako surowy tekst i zagnieździłby go wewnątrz kolejnego
+  /// pola `text` - dokładnie ten błąd, który po drodze
+  /// naprawiliśmy.
   void sendMessage(String text) {
-    final message = Message(user: username, text: text);
-    _channel.sink.add(jsonEncode(message.toJson()));
+    _channel.sink.add(text);
   }
 
   /// Strumień wiadomości przychodzących od serwera.
