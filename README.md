@@ -52,22 +52,32 @@ Działa:
 - Obsługa utraty połączenia: frontend rozróżnia błąd połączenia
   (`onError`) od jego zamknięcia (`onDone`) i pokazuje stosowny
   komunikat zamiast ciszy / wiecznego ładowania.
+- Automatyczny reconnect z exponential backoff (1s, 2s, 4s, 8s...)
+  po utracie połączenia - `ChatService` sam ponawia próby, a
+  konsument `messages` (ekran czatu) subskrybuje stały strumień
+  oparty o `StreamController`, więc nie musi nic wiedzieć o samym
+  mechanizmie ponawiania.
 
 Ważna zasada, na którą warto uważać przy rozbudowie: frontend
 (`ChatService.sendMessage`) wysyła do serwera WYŁĄCZNIE surowy
 tekst wiadomości, bez pakowania w JSON z polem `user` - backend
 sam już zna nazwę użytkownika (ma ją z adresu URL,
 `/ws/{username}`) i to on skleja pełną wiadomość przed
-rozesłaniem. Wysłanie gotowego JSON-a z frontendu spowodowałoby,
-że backend potraktowałby go jako zwykły tekst i zagnieździłby go
-wewnątrz kolejnego pola `text`.
+rozesłaniem.
+
+**Znane ograniczenie (celowo zostawione):** reconnect jawnie
+zamyka stare połączenie przed otwarciem nowego, co backend widzi
+jako zwykłe rozłączenie - nie ma sposobu odróżnić tego od
+chwilowej przerwy. W efekcie każdy reconnect wywołuje mylącą
+wiadomość systemową "X opuścił czat", mimo że użytkownik
+faktycznie zostaje. Poprawne rozwiązanie wymagałoby po stronie
+backendu okresu karencji (grace period) przed ogłoszeniem
+odejścia - patrz `ChatService` (komentarz nad klasą).
 
 Do zrobienia:
 - Ekran logowania (obecnie `username` jest na sztywno wpisane
   w `lib/main.dart`).
-- Ponowne łączenie (reconnect) po utracie połączenia - obecnie
-  `_connectionError` ustawia się raz i na stałe, bez prób
-  automatycznego ponownego połączenia.
+- Grace period w backendzie (patrz znane ograniczenie powyżej).
 - Adres serwera w `chat_service.dart` jest na sztywno ustawiony
   na `10.0.2.2` (adres wymagany na emulatorze Androida) - na
   innych platformach (web, desktop, prawdziwe urządzenie) trzeba
