@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Aplikacja komunikuje się z serwerem czatu przez WebSocket,
+         więc potrzebuje dostępu do sieci. To uprawnienie obowiązuje
+         we wszystkich wariantach builda (debug/profile/release). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <application
         android:label="naukaflutterapi"
         android:name="${applicationName}"

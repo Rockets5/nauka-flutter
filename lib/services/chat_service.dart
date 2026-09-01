@@ -3,121 +3,244 @@ import 'dart:convert';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../models/conversation_state.dart';
 import '../models/message.dart';
+import '../models/system_event.dart';
 
-/// Zarządza połączeniem WebSocket z serwerem czatu, z automatycznym
-/// ponownym łączeniem (reconnect) po utracie połączenia.
+/// Status połączenia transportowego (żywotność socketu WebSocket).
 ///
-/// Odpowiednik backendowego `ConnectionManager` (patrz
-/// `app/services/connection_manager.py`), tylko po stronie klienta:
-/// odpowiada za nawiązanie połączenia, wysyłanie wiadomości oraz
-/// udostępnianie strumienia wiadomości przychodzących.
+/// To OSOBNA oś od [ConversationState] (stanu rozmowy). Można być
+/// [ConversationState.paired] i jednocześnie [ConnectionStatus.connecting]
+/// (chwilowa przerwa w sieci w trakcie rozmowy).
+enum ConnectionStatus {
+  /// Trwa próba połączenia - pierwsza albo po zerwaniu.
+  connecting,
+
+  /// Socket działa, dane płyną.
+  connected,
+
+  /// Poddano się po serii nieudanych prób (patrz
+  /// [ChatService._maxReconnectAttempts]). UI powinno zaproponować
+  /// ręczne ponowienie ([ChatService.retry]).
+  givenUp,
+}
+
+/// Zarządza połączeniem WebSocket z serwerem czatu 1-na-1.
 ///
-/// Wywołaj [connect] zanim użyjesz [sendMessage] lub [messages].
-/// Wywołaj [dispose] po zakończeniu pracy z ekranem czatu, żeby
-/// zamknąć połączenie i nie zostawiać go otwartego w tle.
+/// Odpowiednik backendowego `ConnectionManager` po stronie klienta.
+/// Wystawia TRZY strumienie, każdy o jednej odpowiedzialności:
+/// - [messages] - kolejne wiadomości (zwykłe i systemowe),
+/// - [conversationState] - stan rozmowy wyliczony z wiadomości
+///   systemowych (pole `event`); ekran nie parsuje niczego sam,
+/// - [connectionStatus] - żywotność samego socketu.
 ///
-/// ZNANE OGRANICZENIE: gdy reconnect jawnie zamyka stare połączenie
-/// przed otwarciem nowego, backend widzi to jako zwykłe rozłączenie
-/// (nie ma sposobu odróżnić go od chwilowej przerwy) i rozsyła
-/// wiadomość systemową "X opuścił czat", mimo że użytkownik
-/// faktycznie zostaje. Poprawne rozwiązanie wymagałoby po stronie
-/// backendu okresu karencji (grace period) przed ogłoszeniem
-/// odejścia - celowo zostawione jako przyszłe usprawnienie.
+/// Wywołaj [connect] raz. Ponowne łączenie po zerwaniu obsługuje
+/// [_scheduleReconnect] wewnętrznie (exponential backoff z limitem).
+/// Wywołaj [dispose], gdy ekran czatu jest usuwany.
 class ChatService {
-  late WebSocketChannel _channel;
-
-  /// Nazwa użytkownika, pod jaką wysyłane są wiadomości.
+  /// Nazwa użytkownika - trafia do adresu URL (`/ws/{username}`),
+  /// z którego backend odczytuje nadawcę.
   final String username;
 
-  /// Stały strumień wiadomości, niezależny od tego, ile razy
-  /// zostanie zestawione połączenie WebSocket w tle. Dzięki temu
-  /// kod konsumujący [messages] może zasubskrybować się RAZ i nie
-  /// musi wiedzieć nic o reconnectach dziejących się w środku.
-  final _messagesController = StreamController<Message>.broadcast();
+  WebSocketChannel? _channel;
+  StreamSubscription<dynamic>? _subscription;
 
-  /// Aktualny odstęp przed kolejną próbą ponownego połączenia.
-  /// Rośnie z każdą nieudaną próbą (exponential backoff: 1s, 2s,
-  /// 4s, 8s...), żeby nie zasypywać serwera próbami, gdy jest
-  /// niedostępny dłużej. Resetowany do wartości startowej po
-  /// każdej udanej wymianie danych.
-  Duration _reconnectDelay = const Duration(seconds: 1);
+  final _messagesController = StreamController<Message>.broadcast();
+  final _stateController = StreamController<ConversationState>.broadcast();
+  final _connectionController = StreamController<ConnectionStatus>.broadcast();
+
+  /// Backoff startuje od 1s i podwaja się przy kolejnych nieudanych
+  /// próbach, ale nigdy nie przekracza [_maxReconnectDelay] - powrót
+  /// musi zmieścić się w 60-sekundowym oknie grace period backendu,
+  /// inaczej pokój zostanie zamknięty, zanim zdążymy wrócić.
+  static const _initialReconnectDelay = Duration(seconds: 1);
+  static const _maxReconnectDelay = Duration(seconds: 5);
+
+  /// Po tylu nieudanych próbach z rzędu przestajemy próbować, żeby
+  /// nie zjadać baterii i transferu w nieskończoność. Powrót do
+  /// prób jest możliwy ręcznie przez [retry].
+  static const _maxReconnectAttempts = 8;
+
+  Duration _reconnectDelay = _initialReconnectDelay;
+  int _reconnectAttempts = 0;
+  Timer? _reconnectTimer;
+
+  /// Ustawiane w [dispose]. Chroni przed tym, żeby zaplanowany
+  /// reconnect albo spóźniony callback strumienia nie próbował
+  /// działać na już zamkniętym serwisie.
+  bool _disposed = false;
 
   ChatService({required this.username});
 
+  Stream<Message> get messages => _messagesController.stream;
+  Stream<ConversationState> get conversationState => _stateController.stream;
+  Stream<ConnectionStatus> get connectionStatus =>
+      _connectionController.stream;
+
   /// Nawiązuje połączenie WebSocket z serwerem.
   ///
-  /// UWAGA na emulatorze Androida: `localhost` odnosi się do
-  /// samego emulatora, nie do komputera-hosta. Użyj `10.0.2.2`
-  /// zamiast `localhost`, żeby połączyć się z serwerem
-  /// uruchomionym na Twoim komputerze. Na innych platformach
-  /// (Windows desktop, prawdziwe urządzenie w tej samej sieci)
-  /// adres trzeba dopasować odpowiednio.
-  void connect() {
-    _channel = WebSocketChannel.connect(
+  /// UWAGA na emulatorze Androida: `localhost` odnosi się do samego
+  /// emulatora, nie do komputera-hosta. `10.0.2.2` to alias hosta.
+  ///
+  /// Jest `async`, bo `WebSocketChannel.connect` łączy się LENIWIE -
+  /// dopiero `channel.ready` mówi, czy socket faktycznie stanął.
+  Future<void> connect() async {
+    if (_disposed) return;
+
+    _connectionController.add(ConnectionStatus.connecting);
+
+    final channel = WebSocketChannel.connect(
       Uri.parse('ws://10.0.2.2:8000/ws/$username'),
     );
+    _channel = channel;
 
-    _channel.stream.listen(
-      (raw) {
-        final json = jsonDecode(raw);
-        _messagesController.add(Message.fromJson(json));
+    try {
+      await channel.ready;
+    } catch (_) {
+      // Połączenie nie doszło do skutku - zaplanuj kolejną próbę.
+      _scheduleReconnect();
+      return;
+    }
 
-        // Udane odebranie wiadomości = połączenie działa
-        // poprawnie, więc resetujemy opóźnienie do wartości
-        // startowej na wypadek przyszłych, kolejnych prób.
-        _reconnectDelay = const Duration(seconds: 1);
-      },
-      onError: (error) => _scheduleReconnect(),
+    if (_disposed) {
+      channel.sink.close();
+      return;
+    }
+
+    _subscription = channel.stream.listen(
+      _handleIncoming,
+      // onError i onDone to dwa objawy tego samego: socket przestał
+      // działać. Oba prowadzą do tej samej reakcji.
+      onError: (_) => _scheduleReconnect(),
       onDone: () => _scheduleReconnect(),
     );
+
+    // Sukces - zerujemy backoff, żeby ewentualne przyszłe zerwanie
+    // znów startowało od krótkiego 1s, a nie od rozpędzonego limitu.
+    _reconnectDelay = _initialReconnectDelay;
+    _reconnectAttempts = 0;
+    _connectionController.add(ConnectionStatus.connected);
   }
 
-  /// Planuje kolejną próbę połączenia po [_reconnectDelay], a
-  /// następnie podwaja opóźnienie na wypadek, gdyby również ta
-  /// próba się nie powiodła (exponential backoff).
+  /// Obsługuje jedną przychodzącą ramkę z socketu.
+  void _handleIncoming(dynamic raw) {
+    final Message message;
+    try {
+      final json = jsonDecode(raw as String) as Map<String, dynamic>;
+      message = Message.fromJson(json);
+    } catch (_) {
+      // Nieoczekiwany format ramki - pomijamy ją, zamiast wywracać
+      // całe połączenie (symetrycznie do tego, jak backend traktuje
+      // śmieciowe komendy od klienta).
+      return;
+    }
+
+    _messagesController.add(message);
+
+    // Wiadomość systemowa niesie `event` -> przelicz go na stan
+    // rozmowy i wypchnij na osobny strumień.
+    final event = message.event;
+    if (event != null) {
+      _stateController.add(_stateForEvent(event));
+    }
+  }
+
+  /// Mapuje zdarzenie z backendu na stan rozmowy dla UI.
   ///
-  /// Celowo bez `await` - to jest ZAPLANOWANIE wykonania na
-  /// później, a nie czekanie blokujące resztę aplikacji.
+  /// 5 zdarzeń -> 4 stany: `paired` i `partnerReconnected` prowadzą
+  /// do tego samego [ConversationState.paired], bo z punktu widzenia
+  /// ekranu "jesteś w rozmowie" to jeden stan.
+  ///
+  /// `switch` bez `default` - dodanie wariantu do [SystemEvent]
+  /// wymusi (błąd kompilacji) dopisanie obsługi tutaj.
+  ConversationState _stateForEvent(SystemEvent event) {
+    switch (event) {
+      case SystemEvent.waiting:
+        return ConversationState.waiting;
+      case SystemEvent.paired:
+      case SystemEvent.partnerReconnected:
+        return ConversationState.paired;
+      case SystemEvent.partnerDisconnected:
+        return ConversationState.partnerAway;
+      case SystemEvent.partnerLeft:
+        return ConversationState.partnerLeft;
+    }
+  }
+
+  /// Wysyła wiadomość tekstową do partnera.
+  ///
+  /// Opakowana w komendę JSON `{"type": "message", "text": ...}` -
+  /// backend rozróżnia komendy po polu `type`, bo frontend ma teraz
+  /// więcej niż jedną intencję (patrz [next]).
+  void sendMessage(String text) {
+    _send({'type': 'message', 'text': text});
+  }
+
+  /// Kończy obecną rozmowę (jeśli trwa) i prosi backend o dobranie
+  /// nowego rozmówcy. To jest akcja przycisku "dobierz rozmówcę".
+  void next() {
+    _send({'type': 'next'});
+  }
+
+  void _send(Map<String, dynamic> command) {
+    _channel?.sink.add(jsonEncode(command));
+  }
+
+  /// Planuje kolejną próbę połączenia po [_reconnectDelay], po czym
+  /// podwaja opóźnienie (do [_maxReconnectDelay]). Po
+  /// [_maxReconnectAttempts] próbach z rzędu poddaje się.
   void _scheduleReconnect() {
-    Future.delayed(_reconnectDelay, () {
-      // Jawnie zamykamy stare połączenie przed otwarciem nowego -
-      // bez tego backend mógłby przez chwilę widzieć DWA aktywne
-      // połączenia tego samego użytkownika naraz (duplikujące się
-      // wiadomości), zanim stare samo "dogasło" po swojej stronie.
-      _channel.sink.close();
+    if (_disposed) return;
+
+    // onError i onDone potrafią odpalić się jedno po drugim dla
+    // tego samego zerwania - bez tej straży zaplanowalibyśmy dwie
+    // próby naraz.
+    if (_reconnectTimer != null) return;
+
+    _subscription?.cancel();
+    _subscription = null;
+
+    if (_reconnectAttempts >= _maxReconnectAttempts) {
+      _connectionController.add(ConnectionStatus.givenUp);
+      return;
+    }
+
+    _reconnectAttempts++;
+    _connectionController.add(ConnectionStatus.connecting);
+
+    _reconnectTimer = Timer(_reconnectDelay, () {
+      _reconnectTimer = null;
+      _channel?.sink.close();
       connect();
     });
 
-    _reconnectDelay *= 2;
+    final doubled = _reconnectDelay * 2;
+    _reconnectDelay =
+        doubled > _maxReconnectDelay ? _maxReconnectDelay : doubled;
   }
 
-  /// Wysyła surowy tekst wiadomości do serwera.
-  ///
-  /// Wysyłamy TYLKO tekst, bez pakowania w [Message] - backend
-  /// sam już zna [username] (ma go z adresu URL, `/ws/{username}`)
-  /// i to on skleja pełną wiadomość (user + text) przed
-  /// rozesłaniem jej dalej. Gdyby frontend wysyłał tu gotowy
-  /// JSON z polem `user`, backend potraktowałby cały ten JSON
-  /// jako surowy tekst i zagnieździłby go wewnątrz kolejnego
-  /// pola `text`.
-  void sendMessage(String text) {
-    _channel.sink.add(text);
+  /// Ręczne wznowienie prób po tym, jak [connectionStatus] zgłosił
+  /// [ConnectionStatus.givenUp] (np. przycisk "Spróbuj ponownie").
+  void retry() {
+    if (_disposed) return;
+
+    _reconnectAttempts = 0;
+    _reconnectDelay = _initialReconnectDelay;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    connect();
   }
 
-  /// Stały strumień wiadomości - subskrybuj go RAZ (np. w
-  /// `initState()` ekranu), a będzie dostarczał dane niezależnie
-  /// od tego, ile razy w środku [connect] zostanie wywołane
-  /// ponownie przy reconnect.
-  Stream<Message> get messages => _messagesController.stream;
-
-  /// Zamyka połączenie WebSocket oraz wewnętrzny [_messagesController].
-  ///
-  /// Wywołaj to, gdy ekran czatu jest usuwany (np. w `dispose()`
-  /// widżetu), żeby nie zostawić otwartego połączenia w tle
-  /// (wyciek zasobów).
+  /// Zamyka połączenie i wszystkie trzy strumienie. Wywołaj z
+  /// `dispose()` widżetu ekranu czatu, żeby nie zostawić otwartego
+  /// socketu ani zaplanowanego reconnectu w tle.
   void dispose() {
-    _channel.sink.close();
+    _disposed = true;
+    _reconnectTimer?.cancel();
+    _subscription?.cancel();
+    _channel?.sink.close();
     _messagesController.close();
+    _stateController.close();
+    _connectionController.close();
   }
 }

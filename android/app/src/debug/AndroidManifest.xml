@@ -4,4 +4,16 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- TYLKO w buildzie debug: pozwól na nieszyfrowany ruch
+         (http:// / ws://). Od Androida 9 (API 28) jest on domyślnie
+         blokowany na poziomie systemu - bez tego połączenie z
+         lokalnym serwerem deweloperskim (ws://10.0.2.2:8000) kończy
+         się błędem "Operation not permitted, errno = 1".
+
+         Manifest merger dokłada ten atrybut do <application>
+         zdefiniowanego w main/AndroidManifest.xml. W buildzie
+         release ten plik nie jest używany, więc produkcyjna wersja
+         nadal wymaga szyfrowanego wss://. -->
+    <application android:usesCleartextTraffic="true" />
 </manifest>

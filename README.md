@@ -1,14 +1,15 @@
 # Chat App
 
-Prosty czat na żywo: backend FastAPI (WebSocket) + frontend Flutter.
+Docelowo: całkowicie anonimowy czat, w którym system sam losowo
+dobiera rozmówcę (1-na-1), z rejestracją samym hasłem (bez loginu).
+Budowany etapami - obecny stan poniżej.
 
 ## Architektura
 
 Backend i frontend to dwa osobne, niepowiązane ze sobą projekty,
-komunikujące się wyłącznie przez WebSocket. Oba stosują ten sam
-podział odpowiedzialności:
+komunikujące się wyłącznie przez WebSocket.
 
-| Warstwa                              | Backend (`chat_backend/app/`) | Frontend (`chat_frontend/lib/`) |
+| Warstwa                              | Backend (`nauka-fastapi/app/`) | Frontend (`app0/lib/`) |
 |---------------------------------------|--------------------------------|-----------------------------------|
 | Adresy / co użytkownik "odwiedza"     | `routers/`                     | `screens/`                        |
 | Logika (co się dzieje w środku)       | `services/`                    | `services/`                       |
@@ -17,7 +18,7 @@ podział odpowiedzialności:
 ## Backend
 
 ```bash
-cd chat_backend
+cd nauka-fastapi
 python -m venv venv
 source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -29,7 +30,7 @@ Serwer nasłuchuje na `ws://localhost:8000/ws/{username}`.
 ## Frontend
 
 ```bash
-cd chat_frontend
+cd app0
 flutter pub get
 flutter run
 ```
@@ -41,44 +42,81 @@ metoda `connect()`):
   zamień `10.0.2.2` na `localhost` albo adres IP komputera z
   uruchomionym backendem.
 
-## Stan projektu
+## Stan backendu (etap 1: matchmaking - PRZETESTOWANY, bugi naprawione)
 
-Działa:
-- Połączenie, wysyłanie i odbieranie wiadomości, z pełną,
-  rosnącą historią.
-- Wiadomości systemowe: gdy użytkownik się rozłączy, backend
-  rozsyła do pozostałych informację o tym fakcie (wyświetlaną
-  na froncie inaczej niż zwykłe wiadomości).
-- Obsługa utraty połączenia: frontend rozróżnia błąd połączenia
-  (`onError`) od jego zamknięcia (`onDone`) i pokazuje stosowny
-  komunikat zamiast ciszy / wiecznego ładowania.
-- Automatyczny reconnect z exponential backoff (1s, 2s, 4s, 8s...)
-  po utracie połączenia - `ChatService` sam ponawia próby, a
-  konsument `messages` (ekran czatu) subskrybuje stały strumień
-  oparty o `StreamController`, więc nie musi nic wiedzieć o samym
-  mechanizmie ponawiania.
+Backend przeszedł z modelu "1 wspólny czat, broadcast do
+wszystkich" na model "matchmaking 1-na-1, izolowane pokoje":
 
-Ważna zasada, na którą warto uważać przy rozbudowie: frontend
-(`ChatService.sendMessage`) wysyła do serwera WYŁĄCZNIE surowy
-tekst wiadomości, bez pakowania w JSON z polem `user` - backend
-sam już zna nazwę użytkownika (ma ją z adresu URL,
-`/ws/{username}`) i to on skleja pełną wiadomość przed
-rozesłaniem.
+- **Poczekalnia** (`waiting_room`): nowy użytkownik bez pary trafia
+  tutaj i czeka.
+- **Parowanie** (`_match_or_wait`): gdy ktoś już czeka, nowy
+  użytkownik zostaje z nim sparowany; oboje dostają wiadomość
+  systemową o połączeniu. Wydzielone jako osobna metoda, bo ta
+  sama logika jest potrzebna zarówno przy nowym połączeniu, jak i
+  gdy partner zostaje "uwolniony" po ostatecznym zamknięciu pokoju.
+- **Izolacja**: wiadomości trafiają WYŁĄCZNIE do przypisanego
+  partnera (`send_personal_message`), nie do wszystkich - potwierdzone
+  testem z trzecią osobą w poczekalni, która niczego nie odbiera.
+- **Grace period reconnect**: rozłączenie nie kończy rozmowy od
+  razu - partner dostaje ostrzeżenie, a rozłączony ma 60s na
+  powrót pod tym samym username. Jeśli wróci, pokój jest
+  wznawiany (z nowym obiektem WebSocket) bez utraty rozmowy. Jeśli
+  nie wróci, pokój zostaje ostatecznie zamknięty, partner
+  powiadomiony, i WRACA do matchmakingu (nie zostaje "zawieszony").
 
-**Znane ograniczenie (celowo zostawione):** reconnect jawnie
-zamyka stare połączenie przed otwarciem nowego, co backend widzi
-jako zwykłe rozłączenie - nie ma sposobu odróżnić tego od
-chwilowej przerwy. W efekcie każdy reconnect wywołuje mylącą
-wiadomość systemową "X opuścił czat", mimo że użytkownik
-faktycznie zostaje. Poprawne rozwiązanie wymagałoby po stronie
-backendu okresu karencji (grace period) przed ogłoszeniem
-odejścia - patrz `ChatService` (komentarz nad klasą).
+Cały ten scenariusz (parowanie, izolacja, rozłączenie, powrót w
+oknie 60s, dalsza wymiana wiadomości bez duplikatów) został ręcznie
+przetestowany przez wtyczkę przeglądarki do WebSocket, na 3-4
+użytkownikach naraz.
 
-Do zrobienia:
-- Ekran logowania (obecnie `username` jest na sztywno wpisane
-  w `lib/main.dart`).
-- Grace period w backendzie (patrz znane ograniczenie powyżej).
-- Adres serwera w `chat_service.dart` jest na sztywno ustawiony
-  na `10.0.2.2` (adres wymagany na emulatorze Androida) - na
-  innych platformach (web, desktop, prawdziwe urządzenie) trzeba
-  go tymczasowo zmieniać ręcznie; docelowo warto to zautomatyzować.
+**Bugi napotkane i naprawione po drodze** (warto znać, jeśli
+rozbudowujesz ten kod dalej):
+1. Wpis w `disconnect_tasks` nie był usuwany po naturalnym
+   wygaśnięciu grace period (tylko przy reconnect) - kolejne
+   połączenie tego username błędnie trafiało w gałąź reconnectu
+   mimo braku pokoju → `KeyError`. Naprawione przez `finally` z
+   `disconnect_tasks.pop(username, None)`.
+2. Wysłanie wiadomości do partnera, który stracił połączenie (ale
+   jego grace period jeszcze trwa), rzucało wyjątek, który wylatywał
+   aż do pętli w `chat.py` i błędnie kończył połączenie NADAWCY, nie
+   martwego partnera. Naprawione przez `try/except` wokół
+   `partner_ws.send_text(...)` w `send_personal_message`.
+3. Partner pozostawał "zawieszony" (bez wpisu w `rooms` ani
+   `waiting_room`) po ostatecznym zamknięciu pokoju - nigdy nie
+   mógł zostać sparowany ponownie. Naprawione przez wywołanie
+   `_match_or_wait` dla uwolnionego partnera, WYŁĄCZNIE w gałęzi
+   naturalnego wygaśnięcia (nie w `finally`, bo to uruchamiałoby
+   się też przy udanym reconnect i niszczyło poprawnie odbudowaną
+   parę).
+
+**Ważna zasada:** frontend wysyła do serwera WYŁĄCZNIE surowy
+tekst wiadomości - backend sam zna nadawcę (ma go z URL,
+`/ws/{username}`) i sam skleja pełną wiadomość (`Message`) przed
+wysłaniem jej do partnera.
+
+## Stan frontendu (NIEZSYNCHRONIZOWANY z nowym backendem)
+
+Frontend (`app0/lib/`) wciąż jest zbudowany pod **stary**
+model backendu (1 wspólny czat, wszyscy widzą wszystkich) i **nie
+działa poprawnie** z obecnym backendem matchmakingowym - to
+kolejny krok do zrobienia. W szczególności:
+
+- `ChatService` ma własny mechanizm reconnectu (exponential
+  backoff), niezależny od grace period backendu - te dwa
+  mechanizmy nie są ze sobą zestrojone i prawdopodobnie się gryzą
+  (do zweryfikowania).
+- UI (`chat_screen.dart`) nie ma pojęcia o stanach "czekam na
+  rozmówcę" / "jestem w parze" / "rozmówca odszedł, dobierz
+  nowego" - pokazuje tylko płaską listę wiadomości.
+- Przycisk "wyślij" ma docelowo zamieniać się w "dobierz
+  rozmówcę" po zakończeniu rozmowy - jeszcze niezaimplementowane.
+
+## Do zrobienia (kolejne etapy)
+
+1. **[W TRAKCIE]** Zsynchronizować frontend z nowym backendem
+   matchmakingowym (rozpoznawanie stanów rozmowy, przycisk "dobierz
+   rozmówcę").
+2. Ekran logowania (obecnie `username` jest na sztywno wpisane
+   w `lib/main.dart`).
+3. Rejestracja/logowanie samym hasłem (baza danych, hashowanie,
+   sesje/tokeny) - docelowa, w pełni anonimowa tożsamość konta.
