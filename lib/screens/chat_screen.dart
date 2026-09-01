@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-
+import '../models/conversation_state.dart';
 import '../models/message.dart';
 import '../services/chat_service.dart';
 
@@ -31,11 +31,19 @@ class _ChatScreenState extends State<ChatScreen> {
   final TextEditingController _messageController = TextEditingController();
   final List<Message> _messages = [];
 
-  /// Komunikat błędu połączenia WebSocket, albo `null`, jeśli
-  /// wszystko działa poprawnie. `String?` (ze znakiem zapytania)
-  /// oznacza, że ta zmienna może nie mieć wartości - na start jej
-  /// brak (`null`) po prostu oznacza "na razie bez błędu".
-  String? _connectionError;
+  /// Stan rozmowy (czekam / w parze / rozmówca zniknął / rozmówca
+  /// odszedł), wyliczany przez [ChatService] z wiadomości
+  /// systemowych. `?` (nullable), bo w pierwszej chwili po
+  /// [initState] - zanim z backendu przyjdzie pierwsze zdarzenie -
+  /// nie wiemy jeszcze, w jakim jesteśmy stanie. `null` znaczy
+  /// "jeszcze nie wiadomo".
+  ConversationState? _conversationState;
+
+  /// Stan samego połączenia WebSocket (transport), niezależny od
+  /// stanu rozmowy. Bez `?` - od startu wiadomo, że trwa próba
+  /// połączenia, więc wartość początkowa to
+  /// [ConnectionStatus.connecting].
+  ConnectionStatus _connectionStatus = ConnectionStatus.connecting;
 
   @override
   void initState() {
@@ -45,37 +53,34 @@ class _ChatScreenState extends State<ChatScreen> {
     _chatService = ChatService(username: widget.username);
     _chatService.connect();
 
-    // Nasłuchujemy strumienia ręcznie (zamiast tylko przez
-    // StreamBuilder), żeby dopisywać każdą nową wiadomość do
-    // własnej, rosnącej listy. setState mówi Flutterowi, że stan
-    // się zmienił i UI trzeba przebudować.
+    // ChatService wystawia TRZY strumienie, każdy o jednej
+    // odpowiedzialności. Subskrybujemy każdy osobno i przepisujemy
+    // jego wartość do odpowiedniego pola stanu przez setState -
+    // setState mówi Flutterowi "stan się zmienił, przebuduj UI".
     //
-    // onError to jawny odpowiednik tego, co StreamBuilder
-    // sprawdzał automatycznie przez snapshot.hasError - .listen()
-    // nic nie robi za nas, więc błąd (np. nieudane połączenie od
-    // razu na starcie) trzeba obsłużyć osobno, tutaj.
-    //
-    // onDone to osobny przypadek: utrata JUŻ nawiązanego
-    // połączenia (np. serwer padł) często nie jest "błędem" tylko
-    // zamknięciem strumienia - bez tej obsługi taka sytuacja
-    // przechodziłaby całkowicie w ciszy, bez żadnego komunikatu.
-    _chatService.messages.listen(
-      (message) {
-        setState(() {
-          _messages.add(message);
-        });
-      },
-      onError: (error) {
-        setState(() {
-          _connectionError = 'Nie udało się połączyć z serwerem';
-        });
-      },
-      onDone: () {
-        setState(() {
-          _connectionError = 'Połączenie z serwerem zostało przerwane';
-        });
-      },
-    );
+    // build() czyta potem tylko te pola i nic nie wie o strumieniach
+    // ani WebSocketach.
+
+    // 1. Kolejne wiadomości -> dopisujemy do rosnącej listy.
+    _chatService.messages.listen((message) {
+      setState(() {
+        _messages.add(message);
+      });
+    });
+
+    // 2. Stan rozmowy (wyliczony przez ChatService z pola `event`).
+    _chatService.conversationState.listen((state) {
+      setState(() {
+        _conversationState = state;
+      });
+    });
+
+    // 3. Stan połączenia (żywotność socketu).
+    _chatService.connectionStatus.listen((status) {
+      setState(() {
+        _connectionStatus = status;
+      });
+    });
   }
 
   @override
@@ -101,10 +106,10 @@ class _ChatScreenState extends State<ChatScreen> {
     // możliwości) pokazywać listy wiadomości czy pola do pisania -
     // zwracamy od razu CAŁY inny ekran, zamiast mieszać dwa stany
     // w jednym drzewie widżetów.
-    if (_connectionError != null) {
+    if (_conversationState == ConversationState.paired) {
       return Scaffold(
         appBar: AppBar(title: Text('Czat - ${widget.username}')),
-        body: Center(child: Text(_connectionError!)),
+        body: Center(child: Text(ConversationState.paired.toString())),
       );
     }
 
