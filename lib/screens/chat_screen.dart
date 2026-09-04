@@ -106,17 +106,26 @@ class _ChatScreenState extends State<ChatScreen> {
     // możliwości) pokazywać listy wiadomości czy pola do pisania -
     // zwracamy od razu CAŁY inny ekran, zamiast mieszać dwa stany
     // w jednym drzewie widżetów.
-    if (_conversationState == ConversationState.paired) {
+    if (_connectionStatus == ConnectionStatus.givenUp) {
       return Scaffold(
         appBar: AppBar(title: Text('Czat - ${widget.username}')),
-        body: Center(child: Text(ConversationState.paired.toString())),
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Nie udało się połączyć z serwerem'),
+              ElevatedButton(
+                onPressed: _chatService.retry,
+                child: Text('Spróbuj ponownie'))
+            ],
+          )),
       );
     }
 
     return Scaffold(
       appBar: AppBar(title: Text('Czat - ${widget.username}')),
       body: Column(
-        children: [
+        children: [if (_connectionStatus == ConnectionStatus.connecting) 
           Expanded(
             child: ListView.builder(
               itemCount: _messages.length,
@@ -147,7 +156,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 );
               },
             ),
-          ),
+        ),
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: Row(
